@@ -1,0 +1,21 @@
+{
+    "name": "usualtool/ut-sync",
+    "description": "UT framework sync tool.",
+    "keywords": ["ut-sync", "usualtool", "UT Framework"],
+    "homepage": "https://github.com/usualtool",
+    "license": "Apache-2.0",
+    "authors": [
+        {
+        "name":  "Huang Hui",
+        "email": "usualtool@qq.com"
+        }
+    ],
+    "require": {
+        "phpseclib/phpseclib": "^3"
+    },
+    "autoload": {
+        "psr-4": {
+            "usualtool\\Sync\\": "src"
+        }
+    }
+}
