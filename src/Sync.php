@@ -1,7 +1,6 @@
 <?php
 namespace usualtool\Sync;
 use phpseclib3\Net\SFTP;
-use phpseclib3\Crypt\RSA;
 use phpseclib3\Crypt\PublicKeyLoader;
 class Sync{
     private string $host;
@@ -11,16 +10,15 @@ class Sync{
     private ?string $privateKey = null;
     private int $maxRetries = 3;
     private int $retryDelay = 1;
-    private ?callable $logger = null;
+    private $logger = null;
     public function __construct(
         string $host,
         string $user,
         int $port = 22,
         ?string $password = null,
-        ?string $privateKey = null
-    ){
-        if(!$password && !$privateKey){
-            echo "必须提供密码或私钥";
+        ?string $privateKey = null){
+        if(!$password && !$privateKey) {
+            throw new \InvalidArgumentException("必须提供密码或私钥");
         }
         $this->host = $host;
         $this->port = $port;
@@ -33,40 +31,43 @@ class Sync{
         $this->retryDelay = $delay;
         return $this;
     }
+    public function SetLogger(callable $logger): self{
+        $this->logger = $logger;
+        return $this;
+    }
     private function Connect(): SFTP{
         $lastException = null;
-        for ($i = 0; $i <= $this->maxRetries; $i++) {
+        for($i = 0; $i <= $this->maxRetries; $i++){
             try {
                 $sftp = new SFTP($this->host, $this->port);
                 $sftp->setTimeout(30);
                 $loginSuccess = false;
-                if ($this->privateKey !== null) {
+                if($this->privateKey !== null){
                     $key = PublicKeyLoader::load($this->privateKey, '');
                     $loginSuccess = $sftp->login($this->user, $key);
-                } else {
+                }else{
                     $loginSuccess = $sftp->login($this->user, $this->password);
                 }
-                if ($loginSuccess) {
-                    if ($i > 0) {
-                        echo "重连成功 (尝试 {$i} 次)";
+                if($loginSuccess){
+                    if($i > 0){
+                        echo "重连成功 (尝试 {$i} 次)\n";
                     }
                     return $sftp;
-                } else {
-                    echo "SFTP 登录失败";
+                }else{
+                    throw new \RuntimeException("SFTP 登录失败");
                 }
             } catch (\Exception $e) {
                 $lastException = $e;
-                echo "连接失败 (尝试 " . ($i + 1) . "/{$this->maxRetries}): " . $e->getMessage();
-                if ($i < $this->maxRetries) {
+                echo "连接失败 (尝试 " . ($i + 1) . "/{$this->maxRetries}): " . $e->getMessage() . "\n";
+                if($i < $this->maxRetries){
                     sleep($this->retryDelay);
                 }
             }
         }
-        echo "SFTP 连接失败，已重试 {$this->maxRetries} 次";
+        throw new \RuntimeException("SFTP 连接失败，已重试 {$this->maxRetries} 次", 0, $lastException);
     }
-
     /**
-     * 确保远程目录存在（递归创建）
+     * 确保远程目录递归创建
      */
     public function EnsureRemote(SFTP $sftp, string $remoteDir): void{
         $remoteDir = $this->NormalizePath($remoteDir);
@@ -80,22 +81,22 @@ class Sync{
             $current .= '/' . $part;
             if (!$sftp->is_dir($current)) {
                 if (!$sftp->mkdir($current)) {
-                    echo "无法创建远程目录: $current";
+                    throw new \RuntimeException("无法创建远程目录: $current");
                 }
             }
         }
     }
     /**
-     * 获取远程文件 MD5（优先使用 md5sum，fallback 到下载校验）
+     * 获取远程文件MD5指纹
      */
     public function GetFileMd5(SFTP $sftp, string $remotePath, int $maxFileSizeForDownload = 10 * 1024 * 1024): ?string{
         $remotePath = $this->NormalizePath($remotePath);
         $output = $sftp->exec('md5sum ' . escapeshellarg($remotePath) . ' 2>/dev/null');
-        if (preg_match('/^([a-f0-9]{32})/', trim($output), $matches)) {
+        if(preg_match('/^([a-f0-9]{32})/', trim($output), $matches)){
             return $matches[1];
         }
         $stat = $sftp->stat($remotePath);
-        if ($stat && $stat['size'] <= $maxFileSizeForDownload) {
+        if($stat && $stat['size'] <= $maxFileSizeForDownload){
             $content = $sftp->get($remotePath);
             return md5($content);
         }
@@ -105,8 +106,8 @@ class Sync{
      * 安全上传文件
      */
     public function UploadFile(SFTP $sftp, string $localPath, string $remotePath): bool{
-        if (!file_exists($localPath)) {
-            echo "本地文件不存在: $localPath";
+        if(!file_exists($localPath)){
+            throw new \RuntimeException("本地文件不存在: $localPath");
         }
         $remoteDir = dirname($this->NormalizePath($remotePath));
         $this->EnsureRemote($sftp, $remoteDir);
@@ -119,29 +120,35 @@ class Sync{
         return $sftp->delete($this->NormalizePath($remotePath));
     }
     /**
-     * 获取远程文件列表（递归）
+     * 获取远程文件列表（安全递归）
      */
     public function ListRemote(SFTP $sftp, string $remoteBaseDir): array{
         $remoteBaseDir = $this->NormalizePath($remoteBaseDir);
         $files = [];
-
-        $list = $sftp->nlist($remoteBaseDir, true);
+        $this->collectRemoteFiles($sftp, $remoteBaseDir, $remoteBaseDir, $files);
+        return $files;
+    }
+    private function collectRemoteFiles(SFTP $sftp, string $baseDir, string $currentDir, array &$files): void{
+        $list = $sftp->nlist($currentDir);
         if ($list === false) {
-            return [];
+            return;
         }
         foreach ($list as $item) {
-            $fullPath = $remoteBaseDir . '/' . $item;
-            if ($sftp->is_file($fullPath)) {
-                $files[$item] = $fullPath;
+            if ($item === '.' || $item === '..') continue;
+            $fullPath = $currentDir . '/' . $item;
+            if ($sftp->is_dir($fullPath)) {
+                $this->collectRemoteFiles($sftp, $baseDir, $fullPath, $files);
+            } elseif ($sftp->is_file($fullPath)) {
+                $relPath = ltrim(substr($fullPath, strlen($baseDir)), '/');
+                $files[$relPath] = $fullPath;
             }
         }
-        return $files;
     }
     /**
      * 规范化路径，防止 ../ 攻击
      */
     private function NormalizePath(string $path): string{
-        if (strpos($path, '..') !== false) {
+        if(strpos($path, '..') !== false){
             throw new \InvalidArgumentException("路径包含非法字符 '..'");
         }
         return str_replace('\\', '/', $path);
@@ -150,24 +157,23 @@ class Sync{
      * 执行完整同步（主入口）
      */
     public function SyncTo(string $localBaseDir, string $remoteBaseDir, bool $enableDelete = false): array{
-        $this->log('INFO', "开始同步到 {$this->host}");
         $sftp = $this->Connect();
         $result = ['uploaded' => 0, 'deleted' => 0, 'errors' => []];
         $localManifest = $this->BuildManifest($localBaseDir);
         $remoteFiles = $this->ListRemote($sftp, $remoteBaseDir);
         $remoteManifest = [];
-        foreach ($remoteFiles as $relPath => $fullPath) {
+        foreach($remoteFiles as $relPath => $fullPath){
             $md5 = $this->GetFileMd5($sftp, $fullPath);
             $remoteManifest[$relPath] = $md5 ?? 'unknown';
         }
-        foreach ($localManifest as $relPath => $localMd5) {
+        foreach($localManifest as $relPath => $localMd5){
             $remotePath = $remoteBaseDir . '/' . $relPath;
-            if (!isset($remoteManifest[$relPath]) || $remoteManifest[$relPath] !== $localMd5) {
+            if(!isset($remoteManifest[$relPath]) || $remoteManifest[$relPath] !== $localMd5){
                 try {
-                    if ($this->UploadFile($sftp, $localBaseDir . '/' . $relPath, $remotePath)) {
+                    if($this->UploadFile($sftp, $localBaseDir . '/' . $relPath, $remotePath)){
                         $result['uploaded']++;
                         $this->log('INFO', "上传: $relPath");
-                    } else {
+                    }else{
                         $msg = "上传失败: $relPath";
                         $result['errors'][] = $msg;
                         $this->log('ERROR', $msg);
@@ -179,14 +185,15 @@ class Sync{
                 }
             }
         }
+
         if ($enableDelete) {
-            foreach ($remoteManifest as $relPath => $md5) {
-                if (!isset($localManifest[$relPath])) {
+            foreach($remoteManifest as $relPath => $md5){
+                if(!isset($localManifest[$relPath])){
                     $remotePath = $remoteBaseDir . '/' . $relPath;
-                    if ($this->DeleteFile($sftp, $remotePath)) {
+                    if($this->DeleteFile($sftp, $remotePath)){
                         $result['deleted']++;
                         $this->log('INFO', "删除: $relPath");
-                    } else {
+                    }else{
                         $msg = "删除失败: $relPath";
                         $result['errors'][] = $msg;
                         $this->log('ERROR', $msg);
@@ -203,12 +210,20 @@ class Sync{
         $iterator = new \RecursiveIteratorIterator(
             new \RecursiveDirectoryIterator($dir, \RecursiveDirectoryIterator::SKIP_DOTS)
         );
-        foreach ($iterator as $file) {
+        foreach($iterator as $file){
             if ($file->isFile()) {
                 $relPath = ltrim(str_replace($dir, '', $file->getPathname()), '/\\');
                 $manifest[$relPath] = md5_file($file->getPathname());
             }
         }
         return $manifest;
+    }
+    /**
+     * 内部日志方法
+     */
+    private function log(string $level, string $message): void{
+        if($this->logger !== null){
+            call_user_func($this->logger, $level, $message);
+        }
     }
 }
